@@ -1,6 +1,7 @@
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const net = require('net')
 const mineflayer = require('mineflayer')
 
 const PORT = Number(process.env.PORT || 10000)
@@ -9,11 +10,15 @@ const MC_PORT = Number(process.env.MINECRAFT_PORT || 42934)
 const USERNAME = process.env.MINECRAFT_USERNAME || 'BotPlayer'
 const VERSION = process.env.MINECRAFT_VERSION || '26.2'
 const AUTH = process.env.MINECRAFT_AUTH || 'offline'
+const RESTART_KEY = process.env.RESTART_KEY || '' // optional: set karoge to restart ke liye key maangega
 const MAX_LOGS = 200
 const RECONNECT_MS = 5000
 
 let bot = null
+let botId = 0
+let connectWatchdog = null
 let reconnectTimer = null
+let restartTimer = null
 let stopping = false
 const clients = new Set()
 const logs = []
@@ -27,7 +32,10 @@ const state = {
   lastError: null,
   username: USERNAME,
   server: `${HOST}:${MC_PORT}`,
-  version: VERSION
+  version: VERSION,
+  players: 0,
+  playerNames: [],
+  maxPlayers: null
 }
 
 function addLog(level, message, details = null) {
@@ -66,53 +74,146 @@ function broadcast() {
   }
 }
 
+// Bot khud tab-list se players count karta hai (bot ko chhodkar)
+function updatePlayers() {
+  let names = []
+  if (bot && state.status === 'online' && bot.players) {
+    names = Object.keys(bot.players).filter(n => n !== bot.username)
+  }
+  const max = bot && bot.game ? (bot.game.maxPlayers || null) : null
+  if (state.players === names.length && state.maxPlayers === max && state.playerNames.join() === names.join()) return
+  state.players = names.length
+  state.playerNames = names
+  state.maxPlayers = max
+  broadcast()
+}
+setInterval(updatePlayers, 5000)
+
 function scheduleReconnect() {
-  if (stopping || reconnectTimer) return
+  if (stopping || reconnectTimer || restartTimer) return
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
     connectBot()
   }, RECONNECT_MS)
 }
 
+function killBot() {
+  botId++ // purane bot ke saare events ab ignore honge
+  if (connectWatchdog) { clearTimeout(connectWatchdog); connectWatchdog = null }
+  if (!bot) return
+  const old = bot
+  bot = null
+  old.on('error', () => {}) // end() ke baad aane wale errors se crash na ho
+  try { old.end() } catch (_) {}
+}
+
+// Sab kuch stop karke bot ko fresh start karta hai
+function restartBot() {
+  if (stopping || restartTimer) return false
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  killBot()
+  setState('starting', 'Restarting bot...', {
+    lastConnected: null,
+    lastDisconnected: new Date().toISOString(),
+    lastError: null,
+    players: 0,
+    playerNames: [],
+    maxPlayers: null
+  })
+  addLog('warn', 'Restart requested from website', 'Bot stopped, starting fresh in 6s')
+  restartTimer = setTimeout(() => {
+    restartTimer = null
+    connectBot()
+  }, 6000) // server ko purana session band karne ka time
+  return true
+}
+
+// Pehle check karta hai ki server ka port is host se khul raha hai ya nahi
+function probe(host, port, ms = 8000) {
+  return new Promise(resolve => {
+    const s = net.connect({ host, port })
+    let finished = false
+    const done = r => { if (finished) return; finished = true; try { s.destroy() } catch (_) {}; resolve(r) }
+    s.setTimeout(ms, () => done('timeout'))
+    s.once('connect', () => done('open'))
+    s.once('error', e => done(e.code || e.message))
+  })
+}
+
 function connectBot() {
   if (stopping) return
 
-  if (bot) {
-    try { bot.removeAllListeners() } catch (_) {}
-    try { bot.end() } catch (_) {}
-    bot = null
-  }
+  killBot()
+  const myId = botId
+  const alive = () => myId === botId && !stopping
 
+  setState('connecting', `Checking ${HOST}:${MC_PORT}...`)
+  addLog('info', `Checking if server port is reachable: ${HOST}:${MC_PORT}`)
+
+  probe(HOST, MC_PORT).then(result => {
+    if (!alive()) return
+    if (result !== 'open') {
+      setState('offline', `Server unreachable (${result})`, {
+        lastDisconnected: new Date().toISOString(),
+        lastError: `Port check failed: ${result}`
+      })
+      addLog('warn', 'Server port not reachable from this host', `Result: ${result}. Retrying in ${RECONNECT_MS / 1000}s`)
+      scheduleReconnect()
+      return
+    }
+    addLog('success', 'Server port is reachable, joining now')
+    startBot(alive)
+  })
+}
+
+function startBot(alive) {
   setState('connecting', `Connecting to ${HOST}:${MC_PORT}...`)
   addLog('info', `Connecting to Minecraft server ${HOST}:${MC_PORT}`)
 
   try {
-    bot = mineflayer.createBot({
+    const b = mineflayer.createBot({
       host: HOST,
       port: MC_PORT,
       username: USERNAME,
       version: VERSION,
       auth: AUTH
     })
+    bot = b
 
-    bot.once('spawn', () => {
+    // Agar 45s me join nahi hua to hang maanke dobara try karo
+    connectWatchdog = setTimeout(() => {
+      connectWatchdog = null
+      if (!alive() || state.status !== 'connecting') return
+      addLog('warn', 'Connect timeout', 'No response in 45s, retrying')
+      killBot()
+      scheduleReconnect()
+    }, 45000)
+
+    b.once('spawn', () => {
+      if (!alive()) return
+      if (connectWatchdog) { clearTimeout(connectWatchdog); connectWatchdog = null }
       setState('online', 'Bot is inside Minecraft', {
         lastConnected: new Date().toISOString(),
         lastError: null
       })
-      addLog('success', `Bot joined Minecraft as ${bot.username}`)
-      try { bot.chat(`Hello! Main ${bot.username} hoon 😎`) } catch (_) {}
+      addLog('success', `Bot joined Minecraft as ${b.username}`)
+      try { b.chat(`Hello! Main ${b.username} hoon 😎`) } catch (_) {}
+      updatePlayers()
     })
 
-    bot.on('chat', (username, message) => {
-      if (username === bot.username) return
+    b.on('playerJoined', () => { if (alive()) updatePlayers() })
+    b.on('playerLeft', () => { if (alive()) updatePlayers() })
+
+    b.on('chat', (username, message) => {
+      if (!alive() || username === b.username) return
       if (message === '!hello') {
-        try { bot.chat(`Hello ${username}! 👋`) } catch (_) {}
+        try { b.chat(`Hello ${username}! 👋`) } catch (_) {}
         addLog('info', `Replied to ${username} with !hello`)
       }
     })
 
-    bot.on('kicked', reason => {
+    b.on('kicked', reason => {
+      if (!alive()) return
       const text = typeof reason === 'string' ? reason : JSON.stringify(reason)
       setState('offline', 'Bot was kicked from Minecraft', {
         lastDisconnected: new Date().toISOString(),
@@ -121,8 +222,9 @@ function connectBot() {
       addLog('warn', 'Bot kicked from Minecraft', text)
     })
 
-    bot.on('end', reason => {
-      if (stopping) return
+    b.on('end', reason => {
+      if (!alive()) return
+      if (connectWatchdog) { clearTimeout(connectWatchdog); connectWatchdog = null }
       const text = reason ? String(reason) : 'Connection ended'
       setState('offline', 'Minecraft connection ended', {
         lastDisconnected: new Date().toISOString(),
@@ -132,7 +234,8 @@ function connectBot() {
       scheduleReconnect()
     })
 
-    bot.on('error', error => {
+    b.on('error', error => {
+      if (!alive()) return
       const text = error && error.message ? error.message : String(error)
       setState('error', 'Minecraft bot error', { lastError: text })
       addLog('error', 'Mineflayer error', text)
@@ -150,10 +253,9 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`)
 
   if (url.pathname === '/health') {
-    // Render health checks should verify that the web service is alive.
-    // The Minecraft bot state is returned separately in the JSON payload.
+    // Web service alive hai ya nahi (bot ki state JSON me alag se milti hai)
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    return res.end(JSON.stringify({ ok: healthy, ...publicState() }))
+    return res.end(JSON.stringify({ ok: true, ...publicState() }))
   }
 
   if (url.pathname === '/api/status') {
@@ -162,6 +264,18 @@ const server = http.createServer((req, res) => {
       'Cache-Control': 'no-store'
     })
     return res.end(JSON.stringify(publicState()))
+  }
+
+  if (url.pathname === '/api/restart') {
+    const json = { 'Content-Type': 'application/json; charset=utf-8' }
+    if (req.method !== 'POST') { res.writeHead(405, json); return res.end('{"ok":false}') }
+    if (RESTART_KEY && url.searchParams.get('key') !== RESTART_KEY) {
+      res.writeHead(403, json)
+      return res.end('{"ok":false,"error":"key"}')
+    }
+    const ok = restartBot()
+    res.writeHead(ok ? 200 : 409, json)
+    return res.end(JSON.stringify({ ok }))
   }
 
   if (url.pathname === '/api/events') {
@@ -195,10 +309,21 @@ server.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+process.on('uncaughtException', err => {
+  addLog('error', 'Uncaught exception', err && err.stack ? err.stack : err)
+  killBot()
+  scheduleReconnect()
+})
+process.on('unhandledRejection', err => {
+  addLog('error', 'Unhandled rejection', err && err.message ? err.message : err)
+})
+
 function shutdown() {
   if (stopping) return
   stopping = true
   if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (restartTimer) clearTimeout(restartTimer)
+  if (connectWatchdog) clearTimeout(connectWatchdog)
   try { if (bot) bot.end() } catch (_) {}
   for (const res of clients) {
     try { res.end() } catch (_) {}
